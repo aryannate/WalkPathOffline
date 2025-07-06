@@ -1,63 +1,62 @@
 # -*- coding: utf-8 -*-
+"""
+Sanjaya - Advanced Navigation for Visually Impaired (Nuanced Audio Guidance)
+"""
+
 import cv2
 import tkinter as tk
-from tkinter import messagebox, Label, Button, Frame
+from tkinter import messagebox, Label, Frame, Button
 from PIL import Image, ImageTk
-from ultralytics import YOLO
-import torch # NEW: Required for the MiDaS depth model
-import pyttsx3
 import time
 import threading
-import os
+import numpy as np
+import torch
+from ultralytics import YOLO
+import pyttsx3
+import traceback
 
-# --- MODERN UI THEME CONFIGURATION ---
 class ModernTheme:
-    PRIMARY_BLACK = "#000000"
-    PRIMARY_WHITE = "#FFFFFF"
-    SECONDARY_GRAY = "#F8F8F8"
-    ACCENT_GRAY = "#E0E0E0"
-    TEXT_GRAY = "#666666"
-    SUCCESS_GREEN = "#00C851"
-    DANGER_RED = "#FF4444"
-    FONT_LARGE = ("Segoe UI", 24, "bold")
-    FONT_MEDIUM = ("Segoe UI", 14, "normal")
+    PRIMARY_BLACK = "#000000"; PRIMARY_WHITE = "#FFFFFF"; SECONDARY_GRAY = "#F8F8F8"
+    ACCENT_GRAY = "#E0E0E0"; TEXT_GRAY = "#666666"; SUCCESS_GREEN = "#00C851"
+    DANGER_RED = "#FF4444"; FONT_BUTTON = ("Segoe UI", 16, "bold")
     FONT_SMALL = ("Segoe UI", 12, "normal")
-    FONT_BUTTON = ("Segoe UI", 16, "bold")
 
-# --- MAIN APPLICATION CLASS ---
 class SanjayaNavApp:
     def __init__(self, window, title):
         self.window = window
         self.window.title(title)
-        self.window.geometry("1200x800")
+        self.window.geometry("1400x800")
         self.window.configure(bg=ModernTheme.PRIMARY_WHITE)
-        self.window.resizable(True, True)
 
-        self.is_running = False
-        self.cap = None
-        self.latest_frame = None
-        self.ai_thread = None
-        self.last_spoken_time = 0
+        # Fine-tuned parameters for iPhone/Camo
+        self.DEPTH_TO_FEET_FACTOR = 18.0 
+        self.CLOSE_THRESHOLD = 0.8      # Very close objects (meters)
+        self.MEDIUM_THRESHOLD = 1.5     # Medium distance objects (meters)
+        self.FAR_THRESHOLD = 3.0        # Far objects (meters)
+        self.BLOCKED_RATIO = 0.25       # 25% of zone pixels = blocked
+
+        self.is_running = False; self.tts_engine = None; self.is_tts_busy = False
+        self.cap = None; self.ai_thread = None; self.last_spoken_time = 0
+        self.latest_raw_frame = None; self.latest_annotated_frame = None; self.latest_depth_heatmap = None
 
         try:
-            # --- 1. Load YOLO Model ---
-            self.yolo_model = YOLO("yolov8s.pt")
-            
-            # --- 2. Load MiDaS Depth Estimation Model ---
+            print("Initializing AI Engine...")
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
-            self.midas.to(self.device)
-            self.midas.eval()
-            
-            # --- Load MiDaS transforms to prepare the images ---
-            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-            self.transform = midas_transforms.small_transform
+            print(f"Engine using device: {self.device}")
 
-            # --- 3. Initialize Text-to-Speech Engine ---
+            self.yolo_model = YOLO('yolov8l.pt')
+            self.midas = torch.hub.load("intel-isl/MiDaS", 'DPT_Large')
+            self.midas.to(self.device); self.midas.eval()
+            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+            self.transform = midas_transforms.dpt_transform
+            if self.device == 'cuda':
+                self.yolo_model.half(); self.midas.half()
             self.tts_engine = pyttsx3.init()
-            
+            self.tts_engine.say("Audio engine initialized")
+            self.tts_engine.runAndWait()
         except Exception as e:
-            messagebox.showerror("Initialization Error", f"Failed to initialize models or TTS engine: {e}")
+            messagebox.showerror("Initialization Error", f"Failed to initialize models.\n\nError: {e}")
+            traceback.print_exc()
             self.window.destroy()
             return
 
@@ -65,239 +64,269 @@ class SanjayaNavApp:
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def setup_modern_gui(self):
-        # ... (All GUI setup code remains the same)
         main_container = Frame(self.window, bg=ModernTheme.PRIMARY_WHITE)
         main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        header_frame = Frame(main_container, bg=ModernTheme.PRIMARY_WHITE, height=80)
-        header_frame.pack(fill=tk.X, pady=(0, 20))
-        header_frame.pack_propagate(False)
-        title_label = Label(header_frame, text="SANJAYA", font=ModernTheme.FONT_LARGE, bg=ModernTheme.PRIMARY_WHITE, fg=ModernTheme.PRIMARY_BLACK)
-        title_label.pack(side=tk.LEFT, anchor=tk.W, pady=10)
-        subtitle_label = Label(header_frame, text="AI Indoor Navigation Assistant", font=ModernTheme.FONT_MEDIUM, bg=ModernTheme.PRIMARY_WHITE, fg=ModernTheme.TEXT_GRAY)
-        subtitle_label.pack(side=tk.LEFT, anchor=tk.W, padx=(20, 0), pady=15)
-        content_frame = Frame(main_container, bg=ModernTheme.PRIMARY_WHITE)
-        content_frame.pack(fill=tk.BOTH, expand=True)
-        video_container = Frame(content_frame, bg=ModernTheme.PRIMARY_BLACK, relief=tk.FLAT, bd=2)
-        video_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 20))
-        video_container.pack_propagate(False)
-        self.video_label = Label(video_container, bg=ModernTheme.PRIMARY_BLACK, text="CAMERA FEED\n\nPress 'Start Navigation' to begin", fg=ModernTheme.PRIMARY_WHITE, font=ModernTheme.FONT_MEDIUM, justify=tk.CENTER)
-        self.video_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        control_panel = Frame(content_frame, bg=ModernTheme.SECONDARY_GRAY, width=350, relief=tk.FLAT, bd=1)
-        control_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 0))
-        control_panel.pack_propagate(False)
-        control_header = Label(control_panel, text="CONTROL PANEL", font=("Segoe UI", 16, "bold"), bg=ModernTheme.SECONDARY_GRAY, fg=ModernTheme.PRIMARY_BLACK, pady=20)
-        control_header.pack(fill=tk.X, padx=20)
+        main_container.grid_rowconfigure(0, weight=1)
+        main_container.grid_columnconfigure(0, weight=1); main_container.grid_columnconfigure(1, weight=0)
+        display_frame = Frame(main_container, bg=ModernTheme.PRIMARY_WHITE)
+        display_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
+        display_frame.grid_rowconfigure(0, weight=1); display_frame.grid_rowconfigure(1, weight=1); display_frame.grid_columnconfigure(0, weight=1)
+        video_container = Frame(display_frame, bg=ModernTheme.PRIMARY_BLACK, relief=tk.FLAT)
+        video_container.grid(row=0, column=0, sticky="nsew", pady=(0, 5))
+        Label(video_container, text="LIVE CAMERA (OBJECT DETECTION)", font=ModernTheme.FONT_SMALL, bg=ModernTheme.PRIMARY_BLACK, fg=ModernTheme.PRIMARY_WHITE).pack(pady=5)
+        self.video_label = Label(video_container, bg=ModernTheme.PRIMARY_BLACK)
+        self.video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        depth_container = Frame(display_frame, bg=ModernTheme.PRIMARY_BLACK, relief=tk.FLAT)
+        depth_container.grid(row=1, column=0, sticky="nsew", pady=(5, 0))
+        Label(depth_container, text="DEPTH HEATMAP (DISTANCE)", font=ModernTheme.FONT_SMALL, bg=ModernTheme.PRIMARY_BLACK, fg=ModernTheme.PRIMARY_WHITE).pack(pady=5)
+        self.depth_label = Label(depth_container, bg=ModernTheme.PRIMARY_BLACK)
+        self.depth_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        control_panel = Frame(main_container, bg=ModernTheme.SECONDARY_GRAY, width=400, relief=tk.FLAT)
+        control_panel.grid(row=0, column=1, sticky="ns"); control_panel.grid_propagate(False)
+        Label(control_panel, text="CONTROL PANEL", font=("Segoe UI", 16, "bold"), bg=ModernTheme.SECONDARY_GRAY, fg=ModernTheme.PRIMARY_BLACK, pady=20).pack(fill=tk.X, padx=20, pady=(0, 10))
         nav_frame = Frame(control_panel, bg=ModernTheme.SECONDARY_GRAY)
-        nav_frame.pack(fill=tk.X, padx=20, pady=(0, 30))
-        self.btn_start = tk.Button(nav_frame, text="START NAVIGATION", font=ModernTheme.FONT_BUTTON, command=self.start_navigation, bg=ModernTheme.SUCCESS_GREEN, fg=ModernTheme.PRIMARY_WHITE, relief=tk.FLAT, cursor="hand2", pady=15)
+        nav_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
+        self.btn_start = Button(nav_frame, text="START NAVIGATION", font=ModernTheme.FONT_BUTTON, command=self.start_navigation, bg=ModernTheme.SUCCESS_GREEN, fg=ModernTheme.PRIMARY_WHITE, relief=tk.FLAT, cursor="hand2", pady=15)
         self.btn_start.pack(fill=tk.X, pady=(0, 10))
-        self.btn_stop = tk.Button(nav_frame, text="STOP NAVIGATION", font=ModernTheme.FONT_BUTTON, command=self.stop_navigation, state=tk.DISABLED, bg=ModernTheme.DANGER_RED, fg=ModernTheme.PRIMARY_WHITE, relief=tk.FLAT, cursor="hand2", pady=15)
+        self.btn_stop = Button(nav_frame, text="STOP NAVIGATION", font=ModernTheme.FONT_BUTTON, command=self.stop_navigation, state=tk.DISABLED, bg=ModernTheme.DANGER_RED, fg=ModernTheme.PRIMARY_WHITE, relief=tk.FLAT, cursor="hand2", pady=15)
         self.btn_stop.pack(fill=tk.X)
-        audio_section = Frame(control_panel, bg=ModernTheme.PRIMARY_WHITE, relief=tk.FLAT, bd=1)
+        audio_section = Frame(control_panel, bg=ModernTheme.PRIMARY_WHITE, relief=tk.RIDGE, bd=1)
         audio_section.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
-        audio_header = Label(audio_section, text="🔊 AUDIO GUIDANCE", font=("Segoe UI", 14, "bold"), bg=ModernTheme.PRIMARY_WHITE, fg=ModernTheme.PRIMARY_BLACK, pady=15)
-        audio_header.pack(fill=tk.X, padx=15)
-        status_container = Frame(audio_section, bg=ModernTheme.PRIMARY_WHITE)
-        status_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
-        status_label = Label(status_container, text="STATUS:", font=("Segoe UI", 11, "bold"), bg=ModernTheme.PRIMARY_WHITE, fg=ModernTheme.TEXT_GRAY)
-        status_label.pack(anchor=tk.W, pady=(0, 5))
-        self.ai_status_label = Label(status_container, text="System ready. Waiting for activation...", bg=ModernTheme.PRIMARY_WHITE, fg=ModernTheme.PRIMARY_BLACK, wraplength=280, justify=tk.LEFT, font=ModernTheme.FONT_SMALL, pady=10, relief=tk.FLAT, bd=1)
-        self.ai_status_label.pack(fill=tk.BOTH, expand=True, padx=5)
-        cue_label = Label(status_container, text="LAST GUIDANCE:", font=("Segoe UI", 11, "bold"), bg=ModernTheme.PRIMARY_WHITE, fg=ModernTheme.TEXT_GRAY)
-        cue_label.pack(anchor=tk.W, pady=(15, 5))
-        self.audio_cue_display = Label(status_container, text="No guidance yet", bg=ModernTheme.ACCENT_GRAY, fg=ModernTheme.PRIMARY_BLACK, wraplength=280, justify=tk.LEFT, font=("Segoe UI", 12, "italic"), pady=15, relief=tk.FLAT)
-        self.audio_cue_display.pack(fill=tk.X, padx=5)
-        footer_frame = Frame(main_container, bg=ModernTheme.PRIMARY_WHITE, height=40)
-        footer_frame.pack(fill=tk.X, pady=(20, 0))
-        footer_frame.pack_propagate(False)
-        footer_label = Label(footer_frame, text="Powered by YOLOv8 + MiDaS Depth • Designed for Accessibility", font=("Segoe UI", 10, "normal"), bg=ModernTheme.PRIMARY_WHITE, fg=ModernTheme.TEXT_GRAY)
-        footer_label.pack(anchor=tk.CENTER, pady=10)
-
-
-    # --- THE UPGRADED PATHFINDING ENGINE ---
-    def run_rule_based_assistant(self):
-        """Runs in a thread, using both YOLO and MiDaS depth to find a safe path."""
-        while self.is_running:
-            if (time.time() - self.last_spoken_time > 4) and self.latest_frame is not None:
-                self.last_spoken_time = time.time()
-                try:
-                    self.update_status_label("🔍 Analyzing scene...")
-                    frame_for_analysis = self.latest_frame.copy()
-                    
-                    # --- Step 1: YOLO Object Detection ---
-                    yolo_results = self.yolo_model(frame_for_analysis, verbose=False)[0]
-                    frame_height, frame_width, _ = frame_for_analysis.shape
-
-                    # --- Step 2: MiDaS Depth Estimation ---
-                    img_rgb = cv2.cvtColor(frame_for_analysis, cv2.COLOR_BGR2RGB)
-                    input_batch = self.transform(img_rgb).to(self.device)
-                    with torch.no_grad():
-                        prediction = self.midas(input_batch)
-                        prediction = torch.nn.functional.interpolate(
-                            prediction.unsqueeze(1),
-                            size=img_rgb.shape[:2],
-                            mode="bicubic",
-                            align_corners=False,
-                        ).squeeze()
-                    depth_map = prediction.cpu().numpy()
-
-                    # --- Step 3: Map the Lanes using BOTH models ---
-                    lanes = { "at 10 o'clock": "Open", "at 11 o'clock": "Open", "directly ahead": "Open", "at 1 o'clock": "Open", "at 2 o'clock": "Open" }
-                    lane_order = list(lanes.keys())
-                    zone_width = frame_width / 5
-                    
-                    # Block lanes based on YOLO objects
-                    for box in yolo_results.boxes:
-                        if box.conf[0].item() > 0.65:
-                            lane_name = self.get_object_location(frame_width, box)
-                            if lane_name in lanes:
-                                lanes[lane_name] = "Blocked by " + self.yolo_model.names[int(box.cls[0].item())]
-
-                    # Block lanes based on Depth (for walls, etc.)
-                    depth_threshold = depth_map.max() * 0.8 # Anything in the closest 20% of depth is a threat
-                    for i, lane_name in enumerate(lane_order):
-                        if lanes[lane_name] == "Open": # Only check lanes not already blocked by an object
-                            lane_start_x = int(i * zone_width)
-                            lane_end_x = int((i + 1) * zone_width)
-                            lane_depth_area = depth_map[:, lane_start_x:lane_end_x]
-                            if lane_depth_area.size > 0 and lane_depth_area.mean() > depth_threshold:
-                                lanes[lane_name] = "Blocked"
-
-                    # --- Step 4: Find the Best Path ---
-                    start_index, path_length = self.find_best_path(lanes)
-
-                    # --- Step 5: Generate Command Based on Best Path ---
-                    advice = "Obstacles detected. Please stop and evaluate."
-
-                    if path_length >= 3 and lanes["directly ahead"] == "Open":
-                        advice = "Clear path ahead. Proceed."
-                    elif path_length >= 2:
-                        path_center_index = start_index + path_length / 2
-                        if path_center_index < 2:  # Path is to the left
-                            threat_reason = self.get_primary_threat_reason(lanes, 'right')
-                            advice = f"{threat_reason} on your right. Path is clearer to the left."
-                        elif path_center_index > 2:  # Path is to the right
-                            threat_reason = self.get_primary_threat_reason(lanes, 'left')
-                            advice = f"{threat_reason} on your left. Path is clearer to the right."
-                        else:
-                            advice = "Clear path ahead. Proceed."
-                    
-                    self.update_status_label("🎯 Guidance ready")
-                    self.update_audio_cue_display(advice)
-                    self.speak(advice)
-
-                except Exception as e:
-                    print(f"[AI Error]: {e}")
-                    self.update_status_label("❌ Rule Engine Error")
-            time.sleep(0.5)
-
-    def get_primary_threat_reason(self, lanes, side):
-        """Finds the reason a side is blocked."""
-        if side == 'left':
-            locations = ["at 11 o'clock", "at 10 o'clock"]
-        else: # side == 'right'
-            locations = ["at 1 o'clock", "at 2 o'clock"]
-
-        for loc in locations:
-            if lanes[loc].startswith("Blocked by "):
-                return lanes[loc].replace("Blocked by ", "").capitalize()
-        
-        if lanes["directly ahead"].startswith("Blocked by"):
-            return lanes["directly ahead"].replace("Blocked by ", "").capitalize()
-            
-        return "Obstacle"
-
-    # All other methods (find_best_path, start/stop_navigation, etc.) remain the same...
-    def find_best_path(self, lanes):
-        lane_order = ["at 10 o'clock", "at 11 o'clock", "directly ahead", "at 1 o'clock", "at 2 o'clock"]
-        max_len, best_start_index = 0, -1
-        current_len, current_start_index = 0, -1
-        for i, lane in enumerate(lane_order):
-            if lanes[lane] == "Open":
-                if current_len == 0: current_start_index = i
-                current_len += 1
-            else:
-                if current_len > max_len: max_len, best_start_index = current_len, current_start_index
-                current_len = 0
-        if current_len > max_len: max_len, best_start_index = current_len, current_start_index
-        return best_start_index, max_len
-
-    def get_object_location(self, frame_width, box):
-        box_center_x = box.xywh[0][0].item()
-        zone_width = frame_width / 5
-        if box_center_x < zone_width: return "at 10 o'clock"
-        elif box_center_x < zone_width * 2: return "at 11 o'clock"
-        elif box_center_x < zone_width * 3: return "directly ahead"
-        elif box_center_x < zone_width * 4: return "at 1 o'clock"
-        else: return "at 2 o'clock"
+        Label(audio_section, text="🔊 AUDIO GUIDANCE", font=("Segoe UI", 14, "bold"), bg=ModernTheme.PRIMARY_WHITE, fg=ModernTheme.PRIMARY_BLACK, pady=15).pack(fill=tk.X, padx=15)
+        self.audio_cue_display = Label(audio_section, text="System is ready.", font=("Segoe UI", 12, "italic"), wraplength=340, justify=tk.LEFT, bg=ModernTheme.ACCENT_GRAY, pady=15, relief=tk.FLAT)
+        self.audio_cue_display.pack(fill=tk.X, pady=10, padx=15)
 
     def start_navigation(self):
         if self.is_running: return
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
-            messagebox.showerror("Camera Error", "Could not access the webcam.")
-            return
+            messagebox.showerror("Camera Error", "Could not access webcam."); return
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.is_running = True
-        self.btn_start.config(state=tk.DISABLED)
-        self.btn_stop.config(state=tk.NORMAL)
-        self.update_status_label("🟢 Navigation system activated")
-        self.speak("Sanjaya navigation system activated.")
-        self.ai_thread = threading.Thread(target=self.run_rule_based_assistant, daemon=True)
+        self.btn_start.config(state=tk.DISABLED); self.btn_stop.config(state=tk.NORMAL)
+        self.speak("Navigation system activated.")
+        self.ai_thread = threading.Thread(target=self.run_ai_assistant, daemon=True)
         self.ai_thread.start()
-        self.update_frame()
+        self.update_gui_loop()
         
     def stop_navigation(self):
         if not self.is_running: return
         self.is_running = False
-        self.btn_start.config(state=tk.NORMAL)
-        self.btn_stop.config(state=tk.DISABLED)
+        if self.ai_thread and self.ai_thread.is_alive():
+            self.ai_thread.join(timeout=1.0)
         if self.cap:
-            self.cap.release()
-            self.cap = None
-        self.video_label.config(image='', text="CAMERA FEED\n\nPress 'Start Navigation' to begin", bg=ModernTheme.PRIMARY_BLACK)
-        self.update_status_label("🔴 System offline")
-        self.update_audio_cue_display("No guidance yet")
-        self.speak("Sanjaya navigation system shutting down.")
+            self.cap.release(); self.cap = None
+        self.btn_start.config(state=tk.NORMAL); self.btn_stop.config(state=tk.DISABLED)
+        self.video_label.config(image=''); self.depth_label.config(image='')
+        self.update_audio_cue_display("Navigation stopped.")
+        self.speak("Navigation system shutting down.")
         
     def on_close(self):
         self.stop_navigation()
-        self.window.after(200, self.window.destroy)
+        if self.tts_engine: self.tts_engine.stop()
+        self.window.destroy()
 
-    def update_frame(self):
-        if self.is_running and self.cap:
-            ret, frame = self.cap.read()
-            if ret:
-                self.latest_frame = frame.copy()
-                results = self.yolo_model(frame, verbose=False)
-                annotated_frame = results[0].plot()
-                label_w = self.video_label.winfo_width()
-                label_h = self.video_label.winfo_height()
-                if label_w > 1 and label_h > 1:
-                    rgb_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                    img = Image.fromarray(rgb_frame)
-                    img = img.resize((label_w, label_h), Image.Resampling.LANCZOS)
-                    imgtk = ImageTk.PhotoImage(image=img)
-                    self.video_label.imgtk = imgtk
-                    self.video_label.config(image=imgtk, text="")
-            self.window.after(20, self.update_frame)
+    def run_ai_assistant(self):
+        while self.is_running:
+            try:
+                if self.latest_raw_frame is not None:
+                    frame_for_analysis = self.latest_raw_frame.copy()
+                    annotated_frame, depth_heatmap, advice = self.process_full_pipeline(frame_for_analysis)
+                    self.latest_annotated_frame = annotated_frame
+                    self.latest_depth_heatmap = depth_heatmap
+                    
+                    if (time.time() - self.last_spoken_time > 3) and advice:
+                        self.last_spoken_time = time.time()
+                        self.update_audio_cue_display(advice)
+                        self.speak(advice)
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"[AI Thread Error]: {e}"); traceback.print_exc(); time.sleep(1)
+
+    def update_gui_loop(self):
+        if not self.is_running: return
+        ret, frame = self.cap.read()
+        if ret:
+            self.latest_raw_frame = frame
+            if self.latest_annotated_frame is not None:
+                self.display_image(self.latest_annotated_frame, self.video_label)
+            else:
+                self.display_image(frame, self.video_label)
+            if self.latest_depth_heatmap is not None:
+                self.display_image(self.latest_depth_heatmap, self.depth_label)
+        self.window.after(33, self.update_gui_loop)
+
+    def process_full_pipeline(self, frame):
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        input_batch = self.transform(img_rgb).to(self.device)
+        if self.device == 'cuda': input_batch = input_batch.half()
+        with torch.no_grad():
+            prediction = self.midas(input_batch)
+            prediction = torch.nn.functional.interpolate(
+                prediction.unsqueeze(1), size=img_rgb.shape[:2], mode="bicubic", align_corners=False
+            ).squeeze()
+        depth_map = prediction.cpu().numpy()
+        depth_map[np.isnan(depth_map) | np.isinf(depth_map)] = 0
+        yolo_results = self.yolo_model(frame, verbose=False, imgsz=320)[0]
+
+        frame_width = frame.shape[1]
+        advice = self._get_advanced_navigation(depth_map, yolo_results, frame_width)
+        annotated_frame = yolo_results.plot()
+        depth_heatmap = self._visualize_depth_map(depth_map)
+        return annotated_frame, depth_heatmap, advice
+
+    def _get_advanced_navigation(self, depth_map, yolo_results, frame_width):
+        """Advanced navigation logic with nuanced directional guidance"""
+        zones = ['extreme left', 'left', 'center', 'right', 'extreme right']
+        zone_indices = [0, frame_width//5, 2*frame_width//5, 3*frame_width//5, 4*frame_width//5, frame_width]
         
+        # Analyze each zone for multiple distance thresholds
+        zone_analysis = {}
+        for i, zone_name in enumerate(zones):
+            zone = depth_map[:, zone_indices[i]:zone_indices[i+1]]
+            
+            # Convert depth to actual distances (assuming MiDaS inverse depth)
+            zone_distances = self.DEPTH_TO_FEET_FACTOR / (zone + 1e-6)  # Add small value to prevent division by zero
+            
+            # Calculate statistics for this zone
+            close_pixels = np.sum(zone_distances < self.CLOSE_THRESHOLD)
+            medium_pixels = np.sum((zone_distances >= self.CLOSE_THRESHOLD) & (zone_distances < self.MEDIUM_THRESHOLD))
+            total_pixels = zone.size
+            
+            close_ratio = close_pixels / total_pixels
+            medium_ratio = medium_pixels / total_pixels
+            
+            zone_analysis[zone_name] = {
+                'close_ratio': close_ratio,
+                'medium_ratio': medium_ratio,
+                'min_distance': np.min(zone_distances),
+                'mean_distance': np.mean(zone_distances),
+                'is_blocked': close_ratio > self.BLOCKED_RATIO
+            }
+
+        # Detect objects and their positions
+        detected_objects = self._detect_objects_in_zones(yolo_results, depth_map, zone_indices, zones)
+        
+        # Generate navigation advice based on comprehensive analysis
+        return self._generate_navigation_advice(zone_analysis, detected_objects)
+
+    def _detect_objects_in_zones(self, yolo_results, depth_map, zone_indices, zones):
+        """Detect objects and determine their zone and distance"""
+        objects = {}
+        for zone in zones:
+            objects[zone] = []
+        
+        for box in yolo_results.boxes:
+            if box.conf[0].item() > 0.6:  # Confidence threshold
+                x_center = int(box.xywh[0][0].item())
+                obj_class = int(box.cls[0])
+                obj_name = self.yolo_model.names[obj_class] if obj_class < len(self.yolo_model.names) else "object"
+                
+                # Determine which zone this object is in
+                for i, zone in enumerate(zones):
+                    if zone_indices[i] <= x_center < zone_indices[i+1]:
+                        # Calculate object distance
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        obj_region = depth_map[max(0, y1):min(depth_map.shape[0], y2), 
+                                            max(0, x1):min(depth_map.shape[1], x2)]
+                        
+                        if obj_region.size > 0:
+                            obj_depth = np.median(obj_region)
+                            obj_distance = self.DEPTH_TO_FEET_FACTOR / (obj_depth + 1e-6)
+                            
+                            objects[zone].append({
+                                'name': obj_name,
+                                'distance': obj_distance,
+                                'confidence': box.conf[0].item()
+                            })
+                        break
+        
+        return objects
+
+    def _generate_navigation_advice(self, zone_analysis, detected_objects):
+        """Generate nuanced navigation advice based on zone analysis and object detection"""
+        
+        # Check for immediate dangers in center
+        center_analysis = zone_analysis['center']
+        if center_analysis['is_blocked'] or center_analysis['min_distance'] < self.CLOSE_THRESHOLD:
+            if detected_objects['center']:
+                obj = detected_objects['center'][0]
+                return f"Stop! {obj['name']} directly ahead at {obj['distance']:.1f} meters."
+            else:
+                return f"Stop! Obstacle directly ahead at {center_analysis['min_distance']:.1f} meters."
+        
+        # Check for objects in side zones and provide steering advice
+        advice_parts = []
+        
+        # Right side analysis
+        if detected_objects['right'] or zone_analysis['right']['is_blocked']:
+            if detected_objects['right']:
+                obj = detected_objects['right'][0]
+                if obj['distance'] < self.MEDIUM_THRESHOLD:
+                    advice_parts.append(f"{obj['name']} on your right, steer slightly left")
+                else:
+                    advice_parts.append(f"{obj['name']} on your right")
+            elif zone_analysis['right']['close_ratio'] > 0.1:
+                advice_parts.append("obstacle on your right, steer slightly left")
+        
+        # Left side analysis
+        if detected_objects['left'] or zone_analysis['left']['is_blocked']:
+            if detected_objects['left']:
+                obj = detected_objects['left'][0]
+                if obj['distance'] < self.MEDIUM_THRESHOLD:
+                    advice_parts.append(f"{obj['name']} on your left, steer slightly right")
+                else:
+                    advice_parts.append(f"{obj['name']} on your left")
+            elif zone_analysis['left']['close_ratio'] > 0.1:
+                advice_parts.append("obstacle on your left, steer slightly right")
+        
+        # Extreme zones (less priority)
+        if detected_objects['extreme right'] and not advice_parts:
+            obj = detected_objects['extreme right'][0]
+            advice_parts.append(f"{obj['name']} on your far right, continue straight")
+        
+        if detected_objects['extreme left'] and not advice_parts:
+            obj = detected_objects['extreme left'][0]
+            advice_parts.append(f"{obj['name']} on your far left, continue straight")
+        
+        # Default case - path is clear
+        if not advice_parts:
+            return "Path is clear, continue straight"
+        
+        return ". ".join(advice_parts) + "."
+
+    def _visualize_depth_map(self, depth_map):
+        if depth_map is None or depth_map.size == 0:
+            return np.zeros((100, 100, 3), dtype=np.uint8)
+        depth_map_32f = depth_map.astype(np.float32)
+        output_normalized = cv2.normalize(depth_map_32f, None, 255, 0, cv2.NORM_MINMAX, cv2.CV_8U)
+        return cv2.applyColorMap(output_normalized, cv2.COLORMAP_INFERNO)
+
     def speak(self, text):
         def do_speak():
+            if self.is_tts_busy: return
             try:
+                self.is_tts_busy = True
                 self.tts_engine.say(text)
                 self.tts_engine.runAndWait()
-            except Exception as e:
-                print(f"[TTS Error]: {e}")
-        self.window.after(0, do_speak)
-        
-    def update_status_label(self, text):
-        self.window.after(0, lambda: self.ai_status_label.config(text=text))
-        
-    def update_audio_cue_display(self, text):
-        self.window.after(0, lambda: self.audio_cue_display.config(text=text))
+            except Exception as e: print(f"[TTS Error]: {e}")
+            finally: self.is_tts_busy = False
+        threading.Thread(target=do_speak, daemon=True).start()
 
-# --- MAIN ENTRY POINT ---
+    def display_image(self, frame, label):
+        if not label.winfo_exists(): return 
+        label_w, label_h = label.winfo_width(), label.winfo_height()
+        if label_w <= 1 or label_h <= 1: return
+        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        img_pil = img_pil.resize((label_w, label_h), Image.Resampling.LANCZOS)
+        imgtk = ImageTk.PhotoImage(image=img_pil)
+        label.imgtk = imgtk; label.config(image=imgtk)
+
+    def update_audio_cue_display(self, text):
+        if self.audio_cue_display.winfo_exists():
+            self.window.after(0, lambda: self.audio_cue_display.config(text=text))
+
 if __name__ == "__main__":
     root = tk.Tk()
-    app = SanjayaNavApp(root, "Sanjaya - AI Navigation with Depth")
+    app = SanjayaNavApp(root, "Sanjaya - Advanced Navigation for Visually Impaired")
     root.mainloop()
