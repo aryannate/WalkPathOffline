@@ -7,6 +7,7 @@ from ultralytics import YOLO
 import traceback
 import json
 
+# --- Device and Model Setup ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 yolo_model = YOLO('yolov8l.pt')
 midas = torch.hub.load("intel-isl/MiDaS", 'DPT_Large')
@@ -21,6 +22,7 @@ if DEVICE == 'cuda':
 
 DANGER_DEPTH_VALUE = 1.2  # meters
 
+# --- Pipeline Functions ---
 def process_full_pipeline(frame):
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     input_batch = midas_transform(img_rgb).to(DEVICE)
@@ -102,8 +104,8 @@ async def process_image_bytes(image_bytes):
         traceback.print_exc()
         return {"error": str(e)}
 
-# --- This function was missing in your code ---
-async def handler(websocket, path):
+# --- WebSocket Handler ---
+async def handler(websocket):
     print("Client connected.")
     try:
         async for message in websocket:
@@ -117,6 +119,7 @@ async def handler(websocket, path):
     finally:
         print("Client disconnected.")
 
+# --- Server Startup ---
 async def main():
     print("Starting server on ws://0.0.0.0:8765 ...")
     async with websockets.serve(handler, "0.0.0.0", 8765, max_size=8*1024*1024):
