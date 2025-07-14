@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Sanjaya - Advanced Navigation for Visually Impaired (Nuanced Audio Guidance)
+Sanjaya - Concise, Object-Aware Navigation (Final Optimized Version)
 """
 
 import cv2
@@ -28,12 +28,8 @@ class SanjayaNavApp:
         self.window.geometry("1400x800")
         self.window.configure(bg=ModernTheme.PRIMARY_WHITE)
 
-        # Fine-tuned parameters for iPhone/Camo
         self.DEPTH_TO_FEET_FACTOR = 18.0 
-        self.CLOSE_THRESHOLD = 0.8      # Very close objects (meters)
-        self.MEDIUM_THRESHOLD = 1.5     # Medium distance objects (meters)
-        self.FAR_THRESHOLD = 3.0        # Far objects (meters)
-        self.BLOCKED_RATIO = 0.25       # 25% of zone pixels = blocked
+        self.DANGER_DEPTH_VALUE = 1.2  # Tune for your camera/model
 
         self.is_running = False; self.tts_engine = None; self.is_tts_busy = False
         self.cap = None; self.ai_thread = None; self.last_spoken_time = 0
@@ -135,7 +131,7 @@ class SanjayaNavApp:
                     self.latest_annotated_frame = annotated_frame
                     self.latest_depth_heatmap = depth_heatmap
                     
-                    if (time.time() - self.last_spoken_time > 3) and advice:
+                    if (time.time() - self.last_spoken_time > 4) and advice:
                         self.last_spoken_time = time.time()
                         self.update_audio_cue_display(advice)
                         self.speak(advice)
@@ -170,130 +166,72 @@ class SanjayaNavApp:
         yolo_results = self.yolo_model(frame, verbose=False, imgsz=320)[0]
 
         frame_width = frame.shape[1]
-        advice = self._get_advanced_navigation(depth_map, yolo_results, frame_width)
+        advice = self._get_zone_based_navigation(depth_map, yolo_results, frame_width)
         annotated_frame = yolo_results.plot()
         depth_heatmap = self._visualize_depth_map(depth_map)
         return annotated_frame, depth_heatmap, advice
 
-    def _get_advanced_navigation(self, depth_map, yolo_results, frame_width):
-        """Advanced navigation logic with nuanced directional guidance"""
+    def _get_zone_based_navigation(self, depth_map, yolo_results, frame_width):
         zones = ['extreme left', 'left', 'center', 'right', 'extreme right']
         zone_indices = [0, frame_width//5, 2*frame_width//5, 3*frame_width//5, 4*frame_width//5, frame_width]
-        
-        # Analyze each zone for multiple distance thresholds
-        zone_analysis = {}
-        for i, zone_name in enumerate(zones):
+        zone_status = {}
+        zone_objects = {z: [] for z in zones}
+
+        for i in range(5):
             zone = depth_map[:, zone_indices[i]:zone_indices[i+1]]
-            
-            # Convert depth to actual distances (assuming MiDaS inverse depth)
-            zone_distances = self.DEPTH_TO_FEET_FACTOR / (zone + 1e-6)  # Add small value to prevent division by zero
-            
-            # Calculate statistics for this zone
-            close_pixels = np.sum(zone_distances < self.CLOSE_THRESHOLD)
-            medium_pixels = np.sum((zone_distances >= self.CLOSE_THRESHOLD) & (zone_distances < self.MEDIUM_THRESHOLD))
-            total_pixels = zone.size
-            
-            close_ratio = close_pixels / total_pixels
-            medium_ratio = medium_pixels / total_pixels
-            
-            zone_analysis[zone_name] = {
-                'close_ratio': close_ratio,
-                'medium_ratio': medium_ratio,
-                'min_distance': np.min(zone_distances),
-                'mean_distance': np.mean(zone_distances),
-                'is_blocked': close_ratio > self.BLOCKED_RATIO
-            }
+            avg_depth = np.mean(zone)
+            # For iPhone/Camo: clear if avg_depth >= threshold (meters)
+            zone_status[zones[i]] = 'blocked' if avg_depth < self.DANGER_DEPTH_VALUE else 'clear'
 
-        # Detect objects and their positions
-        detected_objects = self._detect_objects_in_zones(yolo_results, depth_map, zone_indices, zones)
-        
-        # Generate navigation advice based on comprehensive analysis
-        return self._generate_navigation_advice(zone_analysis, detected_objects)
-
-    def _detect_objects_in_zones(self, yolo_results, depth_map, zone_indices, zones):
-        """Detect objects and determine their zone and distance"""
-        objects = {}
-        for zone in zones:
-            objects[zone] = []
-        
+        # Assign objects to zones, always mention them if detected
         for box in yolo_results.boxes:
-            if box.conf[0].item() > 0.6:  # Confidence threshold
-                x_center = int(box.xywh[0][0].item())
-                obj_class = int(box.cls[0])
-                obj_name = self.yolo_model.names[obj_class] if obj_class < len(self.yolo_model.names) else "object"
-                
-                # Determine which zone this object is in
-                for i, zone in enumerate(zones):
-                    if zone_indices[i] <= x_center < zone_indices[i+1]:
-                        # Calculate object distance
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        obj_region = depth_map[max(0, y1):min(depth_map.shape[0], y2), 
-                                            max(0, x1):min(depth_map.shape[1], x2)]
-                        
-                        if obj_region.size > 0:
-                            obj_depth = np.median(obj_region)
-                            obj_distance = self.DEPTH_TO_FEET_FACTOR / (obj_depth + 1e-6)
-                            
-                            objects[zone].append({
-                                'name': obj_name,
-                                'distance': obj_distance,
-                                'confidence': box.conf[0].item()
-                            })
-                        break
-        
-        return objects
+            x_center = int(box.xywh[0][0].item())
+            obj_class = int(box.cls[0])
+            obj_name = self.yolo_model.names[obj_class] if obj_class < len(self.yolo_model.names) else "object"
+            for i in range(5):
+                if zone_indices[i] <= x_center < zone_indices[i+1]:
+                    zone_objects[zones[i]].append(obj_name)
+                    break
 
-    def _generate_navigation_advice(self, zone_analysis, detected_objects):
-        """Generate nuanced navigation advice based on zone analysis and object detection"""
-        
-        # Check for immediate dangers in center
-        center_analysis = zone_analysis['center']
-        if center_analysis['is_blocked'] or center_analysis['min_distance'] < self.CLOSE_THRESHOLD:
-            if detected_objects['center']:
-                obj = detected_objects['center'][0]
-                return f"Stop! {obj['name']} directly ahead at {obj['distance']:.1f} meters."
+        # 1. Center object warning has highest priority
+        if zone_objects['center']:
+            obj = zone_objects['center'][0]
+            if zone_status['center'] == 'blocked':
+                return f"{obj} ahead, proceed with caution."
             else:
-                return f"Stop! Obstacle directly ahead at {center_analysis['min_distance']:.1f} meters."
-        
-        # Check for objects in side zones and provide steering advice
-        advice_parts = []
-        
-        # Right side analysis
-        if detected_objects['right'] or zone_analysis['right']['is_blocked']:
-            if detected_objects['right']:
-                obj = detected_objects['right'][0]
-                if obj['distance'] < self.MEDIUM_THRESHOLD:
-                    advice_parts.append(f"{obj['name']} on your right, steer slightly left")
-                else:
-                    advice_parts.append(f"{obj['name']} on your right")
-            elif zone_analysis['right']['close_ratio'] > 0.1:
-                advice_parts.append("obstacle on your right, steer slightly left")
-        
-        # Left side analysis
-        if detected_objects['left'] or zone_analysis['left']['is_blocked']:
-            if detected_objects['left']:
-                obj = detected_objects['left'][0]
-                if obj['distance'] < self.MEDIUM_THRESHOLD:
-                    advice_parts.append(f"{obj['name']} on your left, steer slightly right")
-                else:
-                    advice_parts.append(f"{obj['name']} on your left")
-            elif zone_analysis['left']['close_ratio'] > 0.1:
-                advice_parts.append("obstacle on your left, steer slightly right")
-        
-        # Extreme zones (less priority)
-        if detected_objects['extreme right'] and not advice_parts:
-            obj = detected_objects['extreme right'][0]
-            advice_parts.append(f"{obj['name']} on your far right, continue straight")
-        
-        if detected_objects['extreme left'] and not advice_parts:
-            obj = detected_objects['extreme left'][0]
-            advice_parts.append(f"{obj['name']} on your far left, continue straight")
-        
-        # Default case - path is clear
-        if not advice_parts:
-            return "Path is clear, continue straight"
-        
-        return ". ".join(advice_parts) + "."
+                return f"{obj} ahead, you can walk straight, but proceed with caution."
+
+        # 2. If center is blocked but no object, generic caution
+        if zone_status['center'] == 'blocked':
+            return "Obstacle ahead, proceed with caution."
+
+        # 3. Left/right object warnings
+        if zone_objects['left']:
+            obj = zone_objects['left'][0]
+            if zone_status['left'] == 'blocked':
+                return f"{obj} on your left, proceed with caution."
+            else:
+                return f"{obj} on your left, you can go straight, but proceed with caution."
+        if zone_objects['right']:
+            obj = zone_objects['right'][0]
+            if zone_status['right'] == 'blocked':
+                return f"{obj} on your right, proceed with caution."
+            else:
+                return f"{obj} on your right, you can go straight, but proceed with caution."
+
+        # 4. If center is clear and no object, positive cue
+        if zone_status['center'] == 'clear':
+            return "You can walk straight."
+        elif zone_status['left'] == 'clear':
+            return "You can go left."
+        elif zone_status['right'] == 'clear':
+            return "You can go right."
+        elif zone_status['extreme left'] == 'clear':
+            return "You can go extreme left."
+        elif zone_status['extreme right'] == 'clear':
+            return "You can go extreme right."
+        else:
+            return "No clear path detected, proceed with caution."
 
     def _visualize_depth_map(self, depth_map):
         if depth_map is None or depth_map.size == 0:
@@ -328,5 +266,5 @@ class SanjayaNavApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = SanjayaNavApp(root, "Sanjaya - Advanced Navigation for Visually Impaired")
+    app = SanjayaNavApp(root, "Sanjaya - Concise Positive Navigation")
     root.mainloop()
